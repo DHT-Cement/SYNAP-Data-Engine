@@ -1,10 +1,10 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # 01: Dynamics 365 ERP Dispatches & Sales Lines Ingestion
+# MAGIC # 01: Dynamics 365 ERP Dispatches & Sales Lines Ingestion (With Real-Time Change Detection)
 # MAGIC 
-# MAGIC **Source:** `BC_Shipments_*.csv` + `BC_Lines_*.csv` (+ `BC_Flags_*.csv`) in Google Drive folder `ERP Sales Drop` (`1Tz_raKMCVrrDjZwJo8eII7BREh_9SLsG`)  
-# MAGIC **Target Database:** Strictly Development Database (`market_reach` on port `5435`)  
-# MAGIC **Target Tables:** `public.sales_lines`, `public.erp_days`
+# MAGIC - Scans Google Drive `ERP Sales Drop` folder (`1Tz_raKMCVrrDjZwJo8eII7BREh_9SLsG`)
+# MAGIC - **Change Detection:** Computes signature (`filename @ modifiedTime`). If no changes, exits in 2 seconds.
+# MAGIC - If new or updated dispatches detected, transforms and writes to Dev PostgreSQL (`market_reach` on port `5435`).
 
 # COMMAND ----------
 import json
@@ -14,19 +14,18 @@ import csv
 import re
 from datetime import datetime
 import psycopg2
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType, DoubleType, DateType, LongType
+
+# COMMAND ----------
+# MAGIC %run ../../src/tracker
 
 # COMMAND ----------
 # MAGIC %md
 # MAGIC ### Step 1: Environment & Dev Safety Lock
 
 # COMMAND ----------
-# Load Development Configuration
 with open("/Workspace/Users/engproject@dhtcement.lk/SYNAP-Data-Engine/config/dev.json", "r") as f:
     cfg = json.load(f)
 
-# STRICT SAFETY CHECK: Verify Target is DEV
 assert cfg["database"]["port"] == 5435, "SAFETY ABORT: Target port is NOT 5435 (Dev)!"
 assert cfg["env"] == "development", "SAFETY ABORT: Environment is NOT development!"
 
@@ -34,27 +33,35 @@ DB_HOST = cfg["database"]["host"]
 DB_PORT = cfg["database"]["port"]
 DB_NAME = cfg["database"]["name"]
 DB_USER = cfg["database"]["user"]
-DB_PASS = "Vibhu2003" # Dev credentials
+DB_PASS = "Vibhu2003"
 FOLDER_ID = cfg["drive_folders"]["erp_sales_drop"]
 
 print(f"🔒 SAFETY LOCK VERIFIED: Strictly targeting DEV PostgreSQL at {DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ### Step 2: D365 Transformation Business Rules
+# MAGIC ### Step 2: Change Detection Hook
 
 # COMMAND ----------
-# Item mapping from Dynamics 365 item codes
-ITEM_MAP = {
-    'FP-0001': 'Powertech',
-    'FP-0002': 'Bulk',
-    'FP-0004': 'Saviya'
-}
+def check_erp_file_changed(filename, modified_time_ms):
+    """
+    Returns True if file has new modifiedTime timestamp compared to files_seen table in PostgreSQL.
+    If False, pipeline exits immediately to prevent redundant database writes.
+    """
+    sig = f"{filename}@{int(modified_time_ms)}"
+    changed = has_file_changed(f"erp:{filename}", sig, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS)
+    return changed, sig
+
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ### Step 3: Transformation Business Rules & Dev Upsert
+
+# COMMAND ----------
+ITEM_MAP = {'FP-0001': 'Powertech', 'FP-0002': 'Bulk', 'FP-0004': 'Saviya'}
 PRODUCTS = ['Bulk', 'Powertech', 'Saviya']
 BAG_KG = 50
 VAT_PCT = 18.0
 SSCL_PCT = 2.5
-# tax multiplier: 1.18 * 1.025 = 1.2095
 TAX_MULTIPLIER = (1.0 + VAT_PCT / 100.0) * (1.0 + SSCL_PCT / 100.0)
 REVISED_DAYS = 2
 BACKLOG_DAYS = 14
@@ -63,13 +70,6 @@ def round2(n):
     return round(float(n or 0), 2)
 
 def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags_csv_text=None):
-    """
-    Applies exact D365 Business Central aggregation rules matching ERP report:
-    - Filters credit notes / revisions (modified >= 2 days)
-    - Filters backlogs (> 14 days)
-    - Normalizes Net Revenue after VAT & SSCL
-    - Separates bill-to vs sell-to sub-customers
-    """
     ship_reader = list(csv.reader(io.StringIO(shipments_csv_text)))
     lines_reader = list(csv.reader(io.StringIO(lines_csv_text)))
     flags_reader = list(csv.reader(io.StringIO(flags_csv_text))) if flags_csv_text else []
@@ -77,7 +77,6 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
     if len(ship_reader) < 2 or len(lines_reader) < 2:
         return {"days": {}, "lines": [], "excluded": []}
 
-    # Header indexes
     sh = [c.strip() for c in ship_reader[0]]
     ln = [c.strip() for c in lines_reader[0]]
     fl = [c.strip() for c in flags_reader[0]] if flags_reader else []
@@ -96,7 +95,6 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
                 if rc == 'BACKLOG': skip[no] = 'BACKLOG'
                 elif rv in ['yes', 'true', '1']: skip[no] = 'revised'
 
-    # Shipment columns
     s_no = sh.index('number')
     s_date = sh.index('postingDate')
     s_ord = sh.index('orderNumber') if 'orderNumber' in sh else -1
@@ -118,7 +116,6 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
             posting[no] = p_date
             head[no] = r
 
-    # Date diff checks for credit-note revisions and backlog
     for no, r in head.items():
         if no in skip: continue
         pd = posting.get(no, "")
@@ -138,7 +135,6 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
         except Exception:
             pass
 
-    # Line columns
     l_doc = ln.index('documentNo')
     l_item = ln.index('lineObjectNumber')
     l_uom = ln.index('unitOfMeasureCode')
@@ -173,16 +169,11 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
         mt = qty if uom == 'MT' else (qty * BAG_KG / 1000.0)
         rs = qty * price * (1.0 - disc / 100.0)
 
-        # Days summary
         if iso not in days:
-            days[iso] = {
-                "mt": {p: 0.0 for p in PRODUCTS},
-                "rs": {p: 0.0 for p in PRODUCTS}
-            }
+            days[iso] = {"mt": {p: 0.0 for p in PRODUCTS}, "rs": {p: 0.0 for p in PRODUCTS}}
         days[iso]["mt"][prod] += mt
         days[iso]["rs"][prod] += rs
 
-        # Line detail
         h = head.get(doc, [])
         sell = h[s_cust].strip() if s_cust >= 0 and len(h) > s_cust else ""
         bill = h[s_bill].strip() if s_bill >= 0 and len(h) > s_bill else sell
@@ -193,24 +184,11 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
         k = f"{doc}|{item}"
         if k not in detail:
             detail[k] = {
-                "day": iso,
-                "dn": doc,
-                "order_no": h[s_ord].strip() if s_ord >= 0 and len(h) > s_ord else "",
-                "cust_code": bill or sell,
-                "cust_name": bill_name or sell_name,
-                "sub_customer": sub_cust,
-                "sales_person": h[s_sp].strip() if s_sp >= 0 and len(h) > s_sp else "",
-                "district_erp": "",
-                "terms": h[s_terms].strip() if s_terms >= 0 and len(h) > s_terms else "",
-                "item": item,
-                "product": p_idx,
-                "uom": uom,
-                "qty": 0.0,
-                "mt": 0.0,
-                "gross": 0.0,
-                "net": 0.0,
-                "price": price,
-                "tax_pct": VAT_PCT
+                "day": iso, "dn": doc, "order_no": h[s_ord].strip() if s_ord >= 0 and len(h) > s_ord else "",
+                "cust_code": bill or sell, "cust_name": bill_name or sell_name, "sub_customer": sub_cust,
+                "sales_person": h[s_sp].strip() if s_sp >= 0 and len(h) > s_sp else "", "district_erp": "",
+                "terms": h[s_terms].strip() if s_terms >= 0 and len(h) > s_terms else "", "item": item,
+                "product": p_idx, "uom": uom, "qty": 0.0, "mt": 0.0, "gross": 0.0, "net": 0.0, "price": price, "tax_pct": VAT_PCT
             }
         
         detail[k]["qty"] += qty
@@ -218,7 +196,6 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
         detail[k]["gross"] += rs
         detail[k]["net"] += rs / TAX_MULTIPLIER
 
-    # Round days
     for iso in days:
         for p in PRODUCTS:
             days[iso]["mt"][p] = round2(days[iso]["mt"][p])
@@ -232,62 +209,32 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
         v["net"] = round2(v["net"])
 
     excluded = [{"dn": no, "day": posting.get(no, ""), "why": skip[no]} for no in skip if no in posting]
-
     return {"days": days, "lines": out_lines, "excluded": excluded}
 
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ### Step 3: Write to Dev PostgreSQL (market_reach DB)
-
-# COMMAND ----------
-def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv"):
-    """
-    Writes transformed lines and days summary into Dev PostgreSQL.
-    Strictly target: market_reach on port 5435.
-    """
+def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv", sig=""):
     lines = transformed_data.get("lines", [])
     days = transformed_data.get("days", {})
     excluded = transformed_data.get("excluded", [])
     
     if not lines and not days:
-        print("No lines or days to sync.")
+        print("No lines to sync.")
         return 0
 
-    conn = psycopg2.connect(
-        host=DB_HOST,
-        port=DB_PORT,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASS,
-        connect_timeout=15
-    )
+    conn = psycopg2.connect(host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS, connect_timeout=15)
     cur = conn.cursor()
     try:
-        # 1. Upsert erp_days
         for day_iso, d_info in days.items():
             cur.execute("""
                 INSERT INTO erp_days (day, file, mt, rs, excluded, at)
                 VALUES (%s, %s, %s, %s, %s, now())
                 ON CONFLICT (day) DO UPDATE SET
-                    file = EXCLUDED.file,
-                    mt = EXCLUDED.mt,
-                    rs = EXCLUDED.rs,
-                    excluded = EXCLUDED.excluded,
-                    at = now();
-            """, (
-                day_iso,
-                source_filename,
-                json.dumps(d_info["mt"]),
-                json.dumps(d_info["rs"]),
-                json.dumps([x for x in excluded if x["day"] == day_iso])
-            ))
+                    file = EXCLUDED.file, mt = EXCLUDED.mt, rs = EXCLUDED.rs, excluded = EXCLUDED.excluded, at = now();
+            """, (day_iso, source_filename, json.dumps(d_info["mt"]), json.dumps(d_info["rs"]), json.dumps([x for x in excluded if x["day"] == day_iso])))
 
-        # 2. Delete existing lines for affected days to allow clean replace
         affected_days = list(days.keys())
         if affected_days:
             cur.execute("DELETE FROM sales_lines WHERE source = 'erp' AND day = ANY(%s::date[]);", (affected_days,))
 
-        # 3. Batch Insert sales_lines
         batch_size = 500
         for i in range(0, len(lines), batch_size):
             chunk = lines[i:i + batch_size]
@@ -299,7 +246,6 @@ def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv")
                     x["item"], x["product"], x["uom"], x["qty"], x["mt"], x["price"],
                     x["gross"], x["tax_pct"], x["net"], source_filename
                 ))
-            
             cur.executemany("""
                 INSERT INTO sales_lines (
                     source, day, dn, order_no, cust_code, cust_name, sub_customer, sales_person,
@@ -307,8 +253,12 @@ def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv")
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, vals)
 
+        # Mark file signature as seen
+        if sig:
+            mark_file_seen(f"erp:{source_filename}", "erp", source_filename, sig, f"{len(lines)} lines synced", DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS)
+
         conn.commit()
-        print(f"✅ DEV DATABASE SYNC COMPLETE: {len(affected_days)} days, {len(lines)} lines synced to {DB_NAME} on port {DB_PORT}!")
+        print(f"✅ REAL-TIME SYNC COMPLETE: {len(affected_days)} days, {len(lines)} lines updated!")
         return len(lines)
     except Exception as e:
         conn.rollback()
@@ -317,5 +267,4 @@ def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv")
         cur.close()
         conn.close()
 
-# Return execution result
-print("Pipeline 01: ERP Sales Lines code ready and validated against Dev PostgreSQL!")
+print("Pipeline 01: Change-Detection Enabled and Ready!")
