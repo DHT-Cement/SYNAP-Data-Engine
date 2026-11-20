@@ -1,0 +1,19 @@
+{
+  "env": "production",
+  "database": {
+    "host": "35.200.154.39",
+    "port": 5432,
+    "name": "market_reach",
+    "user": "postgres",
+    "secret_scope": "synap",
+    "secret_key": "pg_prod_password"
+  },
+  "tax": {
+    "vat_pct": 18.0,
+    "sscl_pct": 2.5
+  },
+  "drive_folders": {
+    "erp_sales_drop": "1Tz_raKMCVrrDjZwJo8eII7BREh_9SLsG",
+    "rebates": "172bZlp4HO_R1UEF5YzZCoyM7JXZTmf_Q"
+  }
+}
