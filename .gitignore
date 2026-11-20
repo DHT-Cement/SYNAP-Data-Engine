@@ -1,0 +1,11 @@
+# Secrets & credentials
+*service_account*.json
+*.key
+*.pem
+credentials.json
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
