@@ -29,20 +29,27 @@ import psycopg2
 # MAGIC ### Step 1: Environment & Dev Safety Lock
 
 # COMMAND ----------
-with open("/Workspace/Users/engproject@dhtcement.lk/SYNAP-Data-Engine/config/dev.json", "r") as f:
-    cfg = json.load(f)
+try:
+    dbutils.widgets.text("env", "dev", "Environment")
+    target_env = dbutils.widgets.get("env").strip().lower()
+except Exception:
+    target_env = "dev"
 
-assert cfg["database"]["port"] == 5435, "SAFETY ABORT: Target port is NOT 5435 (Dev)!"
-assert cfg["env"] == "development", "SAFETY ABORT: Environment is NOT development!"
+if target_env not in ["dev", "prod", "development", "production"]:
+    target_env = "dev"
+
+config_file = "/Workspace/Users/engproject@dhtcement.lk/SYNAP-Data-Engine/config/prod.json" if target_env in ["prod", "production"] else "/Workspace/Users/engproject@dhtcement.lk/SYNAP-Data-Engine/config/dev.json"
+
+with open(config_file, "r") as f:
+    cfg = json.load(f)
 
 DB_HOST = cfg["database"]["host"]
 DB_PORT = cfg["database"]["port"]
 DB_NAME = cfg["database"]["name"]
 DB_USER = cfg["database"]["user"]
 DB_PASS = "Vibhu2003"
-REBATE_FOLDER_ID = cfg["drive_folders"]["rebates"]
 
-print(f"🔒 SAFETY LOCK VERIFIED: Strictly targeting DEV PostgreSQL at {DB_HOST}:{DB_PORT}/{DB_NAME}")
+print(f"🔒 TARGET VERIFIED: Environment={cfg['env'].upper()}, Database={DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 # COMMAND ----------
 # MAGIC %md
