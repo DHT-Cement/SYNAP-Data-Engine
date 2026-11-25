@@ -3,8 +3,11 @@
 # MAGIC # 01: Dynamics 365 ERP Dispatches & Sales Lines Ingestion (With Real-Time Change Detection)
 # MAGIC 
 # MAGIC - Scans Google Drive `ERP Sales Drop` folder (`1Tz_raKMCVrrDjZwJo8eII7BREh_9SLsG`)
-# MAGIC - **Change Detection:** Computes signature (`filename @ modifiedTime`). If no changes, exits in 2 seconds.
-# MAGIC - If new or updated dispatches detected, transforms and writes to Dev PostgreSQL (`market_reach` on port `5435`).
+# MAGIC - **Change Detection:** Computes signature (`filename @ modifiedTime`). If no changes, exits in seconds.
+# MAGIC - If new or updated dispatches detected, transforms and writes to PostgreSQL.
+
+# COMMAND ----------
+# MAGIC %pip install google-api-python-client google-auth psycopg2-binary openpyxl --quiet
 
 # COMMAND ----------
 import json
@@ -14,13 +17,15 @@ import csv
 import re
 from datetime import datetime
 import psycopg2
+from googleapiclient.discovery import build
+from google.oauth2 import service_account
 
 # COMMAND ----------
 # MAGIC %run ../../src/tracker
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ### Step 1: Environment & Dev Safety Lock
+# MAGIC ### Step 1: Environment & Config Lock
 
 # COMMAND ----------
 try:
@@ -42,26 +47,13 @@ DB_PORT = cfg["database"]["port"]
 DB_NAME = cfg["database"]["name"]
 DB_USER = cfg["database"]["user"]
 DB_PASS = "Vibhu2003"
+ERP_FOLDER_ID = cfg.get("drive_folders", {}).get("erp_sales_drop", "1Tz_raKMCVrrDjZwJo8eII7BREh_9SLsG")
 
-print(f"🔒 TARGET VERIFIED: Environment={cfg['env'].upper()}, Database={DB_HOST}:{DB_PORT}/{DB_NAME}")
-
-# COMMAND ----------
-# MAGIC %md
-# MAGIC ### Step 2: Change Detection Hook
-
-# COMMAND ----------
-def check_erp_file_changed(filename, modified_time_ms):
-    """
-    Returns True if file has new modifiedTime timestamp compared to files_seen table in PostgreSQL.
-    If False, pipeline exits immediately to prevent redundant database writes.
-    """
-    sig = f"{filename}@{int(modified_time_ms)}"
-    changed = has_file_changed(f"erp:{filename}", sig, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS)
-    return changed, sig
+print(f"🔒 TARGET VERIFIED: Environment={target_env.upper()}, Database={DB_HOST}:{DB_PORT}/{DB_NAME}")
 
 # COMMAND ----------
 # MAGIC %md
-# MAGIC ### Step 3: Transformation Business Rules & Dev Upsert
+# MAGIC ### Step 2: Transformation Business Rules
 
 # COMMAND ----------
 ITEM_MAP = {'FP-0001': 'Powertech', 'FP-0002': 'Bulk', 'FP-0004': 'Saviya'}
@@ -218,7 +210,12 @@ def transform_d365_shipments_and_lines(shipments_csv_text, lines_csv_text, flags
     excluded = [{"dn": no, "day": posting.get(no, ""), "why": skip[no]} for no in skip if no in posting]
     return {"days": days, "lines": out_lines, "excluded": excluded}
 
-def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv", sig=""):
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ### Step 3: Upsert to PostgreSQL
+
+# COMMAND ----------
+def upsert_to_postgres(transformed_data, source_filename="BC_Shipments.csv", sig=""):
     lines = transformed_data.get("lines", [])
     days = transformed_data.get("days", {})
     excluded = transformed_data.get("excluded", [])
@@ -260,12 +257,13 @@ def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv",
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);
             """, vals)
 
-        # Mark file signature as seen
         if sig:
-            mark_file_seen(f"erp:{source_filename}", "erp", source_filename, sig, f"{len(lines)} lines synced", DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS)
+            # ym from source_filename or first day
+            ym = affected_days[0][:7] if affected_days else datetime.now().strftime("%Y-%m")
+            mark_file_seen(f"erp:{ym}", "erp", source_filename, sig, f"{len(lines)} lines synced ({affected_days[0]}..{affected_days[-1]})", DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS)
 
         conn.commit()
-        print(f"✅ REAL-TIME SYNC COMPLETE: {len(affected_days)} days, {len(lines)} lines updated!")
+        print(f"✅ SYNC COMPLETE: {len(affected_days)} days, {len(lines)} lines updated in {target_env.upper()} DB!")
         return len(lines)
     except Exception as e:
         conn.rollback()
@@ -274,4 +272,71 @@ def upsert_to_dev_postgres(transformed_data, source_filename="BC_Shipments.csv",
         cur.close()
         conn.close()
 
-print("Pipeline 01: Change-Detection Enabled and Ready!")
+# COMMAND ----------
+# MAGIC %md
+# MAGIC ### Step 4: Google Drive Scan & Change-Detection Execution Loop
+
+# COMMAND ----------
+SERVICE_ACCOUNT_PATH = "/Workspace/Users/engproject@dhtcement.lk/SYNAP-Data-Engine/config/service_account.json"
+SCOPES = ['https://www.googleapis.com/auth/drive.readonly']
+
+print(f"Connecting to Google Drive with Service Account: {SERVICE_ACCOUNT_PATH}...")
+creds = service_account.Credentials.from_service_account_file(SERVICE_ACCOUNT_PATH, scopes=SCOPES)
+drive_service = build('drive', 'v3', credentials=creds)
+
+res = drive_service.files().list(
+    q=f"'{ERP_FOLDER_ID}' in parents and trashed = false",
+    fields="files(id, name, modifiedTime, size)",
+    pageSize=50
+).execute()
+drive_files = res.get('files', [])
+print(f"Found {len(drive_files)} files in Google Drive folder '{ERP_FOLDER_ID}'.")
+
+by_name = {f['name']: f for f in drive_files}
+ship_files = [f for f in drive_files if re.match(r"^BC_Shipments_\d{4}-\d{2}-\d{2}", f['name'])]
+ship_files.sort(key=lambda x: x['name'], reverse=True)
+
+per_month = {}
+for s in ship_files:
+    m = re.search(r"(\d{4}-\d{2}-\d{2})", s['name'])
+    if not m: continue
+    as_of = m.group(1)
+    ym = as_of[:7]
+    if ym in per_month: continue
+    lines_name = s['name'].replace('BC_Shipments_', 'BC_Lines_')
+    flags_name = s['name'].replace('BC_Shipments_', 'BC_Flags_')
+    l = by_name.get(lines_name)
+    if not l: continue
+    fl = by_name.get(flags_name)
+    per_month[ym] = {'as_of': as_of, 'ship': s, 'lines': l, 'flags': fl}
+
+total_synced_months = 0
+for ym, m_info in sorted(per_month.items(), reverse=True):
+    ship_f = m_info['ship']
+    lines_f = m_info['lines']
+    flags_f = m_info['flags']
+    
+    ship_mod = int(datetime.fromisoformat(ship_f['modifiedTime'].replace('Z', '+00:00')).timestamp() * 1000)
+    lines_mod = int(datetime.fromisoformat(lines_f['modifiedTime'].replace('Z', '+00:00')).timestamp() * 1000)
+    sig = f"{ship_f['name']}@{ship_mod}+{lines_f['name']}@{lines_mod}"
+    if flags_f:
+        flags_mod = int(datetime.fromisoformat(flags_f['modifiedTime'].replace('Z', '+00:00')).timestamp() * 1000)
+        sig += f"+{flags_f['name']}@{flags_mod}"
+        
+    file_id = f"erp:{ym}"
+    changed = has_file_changed(file_id, sig, DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASS)
+    
+    if not changed:
+        print(f"⏩ [UNCHANGED] Month {ym}: {sig}")
+        continue
+
+    print(f"🚀 [PROCESSING] Month {ym} from {ship_f['name']} & {lines_f['name']}...")
+    ship_text = drive_service.files().get_media(fileId=ship_f['id']).execute().decode('utf-8-sig', errors='replace')
+    lines_text = drive_service.files().get_media(fileId=lines_f['id']).execute().decode('utf-8-sig', errors='replace')
+    flags_text = drive_service.files().get_media(fileId=flags_f['id']).execute().decode('utf-8-sig', errors='replace') if flags_f else None
+    
+    transformed = transform_d365_shipments_and_lines(ship_text, lines_text, flags_text)
+    synced = upsert_to_postgres(transformed, source_filename=ship_f['name'], sig=sig)
+    total_synced_months += 1
+
+print(f"🎉 Pipeline 01 Complete! {total_synced_months} month(s) updated.")
